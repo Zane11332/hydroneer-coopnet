@@ -23,7 +23,7 @@ $script:selfLog = Join-Path $logs "launcher-selftest.txt"
 
 # ---------------------------------------------------------------- window
 $form = New-Object Windows.Forms.Form
-$form.Text = "Hydroneer Co-op 0.2"
+$form.Text = "Hydroneer Co-op 0.3"
 $form.Size = New-Object Drawing.Size(720, 560)
 $form.MinimumSize = New-Object Drawing.Size(640, 480)
 $form.StartPosition = "CenterScreen"

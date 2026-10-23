@@ -14,7 +14,7 @@ if [ -n "${HC_INSTALL_ARGS:-}" ]; then read -r -a INSTALL_ARGS <<< "$HC_INSTALL_
 
 GUI=0
 if [ "${HC_TEXT:-0}" != 1 ] && command -v zenity >/dev/null 2>&1 && [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]; then GUI=1; fi
-TITLE="Hydroneer Co-op 0.2"
+TITLE="Hydroneer Co-op 0.3"
 
 installed() { bash "$PKG/install.sh" --detect "${INSTALL_ARGS[@]}" 2>/dev/null | grep -qx 'INSTALLED=yes'; }   # the game folder decides
 

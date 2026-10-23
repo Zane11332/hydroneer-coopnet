@@ -1,3 +1,4 @@
 dist/
 *.zip
 coopnet_config.lua
+__pycache__/

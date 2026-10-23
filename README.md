@@ -5,8 +5,8 @@ each on their own PC and screen, play in the host's world. Hydroneer itself only
 screen; this mod uses its hidden second player and drives it from the friend's PC over the
 internet.
 
-**Status: early test build (0.2).** It works for two friends who start a new game together, and
-it has bugs. Tested with Hydroneer **Steam build 23218978**. Other game versions may crash at
+**Status: early test build (0.3).** The host plays any world, new or saved; the friend joins at
+any time and gets the host's world. It has bugs. Tested with Hydroneer **Steam build 23218978**. Other game versions may crash at
 start.
 
 ## What works
@@ -23,13 +23,17 @@ start.
   two players must be Steam friends. Nothing to set up on routers.
 - Windows, and Linux through Proton.
 - Both games check that they run the same CoopNet version.
+- Late join: the friend presses F7 at the main menu; the host's game saves, the relays send the
+  save through Steam (about 21 MB, SHA-256 checked), and the friend's game loads it. Terrain edits
+  made after the save are repeated; items keep the host's names.
 
 ## What does not work yet
 
 - Money, shops, buying and selling, machines, building, vehicles and quests. The two worlds drift
   apart if you use them.
-- Saves: play in a new, throwaway world. Do not load your real save for co-op.
-- Joining a game that is already running: start a new game together and press F7 right away.
+- Progress is saved in the host's world only. Back up a save you care about before playing it
+  in co-op: this is a test build.
+- Late join is tested with two copies on one PC; not yet in a real session between two PCs.
 - Linux: tool animations and sounds on the friend's side came in 0.2 and are not yet confirmed
   in a real session. Steam as a Flatpak or Snap is untested.
 - How the game shows water in a bucket is not fully understood: the water fields sync, but the
@@ -37,14 +41,14 @@ start.
 
 ## Install (players)
 
-1. Download `HydroneerCoop-0.2.zip` from the
+1. Download `HydroneerCoop-0.3.zip` from the
    [latest release](https://github.com/Zane11332/hydroneer-coopnet/releases/latest) and unzip it
    somewhere permanent.
 2. Windows: double-click `Start Hydroneer Co-op.bat` and click **Install**.
    Linux: run `bash hydroneer-coop.sh`, choose **Install**, and add the Steam launch option the
    installer prints.
-3. Each time you play, the host clicks **Host** and the friend clicks **Join**. You both start a
-   **new** game and press **F7** once you are in the world.
+3. Each time you play, the host clicks **Host**, loads a world and presses **F7** in it. The friend
+   clicks **Join**, stays at the game's **main menu** and presses **F7** there.
 
 `README.txt` in the zip has the details, troubleshooting and uninstall steps.
 

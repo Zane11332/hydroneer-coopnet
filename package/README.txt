@@ -1,4 +1,4 @@
-HYDRONEER CO-OP (CoopNet) - friend test build 0.2
+HYDRONEER CO-OP (CoopNet) - friend test build 0.3
 ==================================================
 
 Two players, each on their own PC and screen, in the HOST's world. Early test build: expect
@@ -13,11 +13,14 @@ WHAT WORKS
   - Tool animations and the sounds of both players' actions (dig, dump, pickup, throw, drops).
   - Items the game creates while you play show up for both.
   - Both games check that they run the same CoopNet version; the window says so if not.
+  - Playing in the host's own world, new or saved: the friend joins at any time and gets the
+    host's world (sent through Steam, about 21 MB, checked on arrival).
 
 WHAT DOES NOT WORK YET (the worlds will drift apart if you use these)
   - Money, shops, buying and selling, machines, building, vehicles, quests.
-  - Saves: play in a NEW, throwaway world. Do not load your real save for co-op.
-  - Joining a game that is already running: both of you start a NEW game at the same time.
+  - Progress is saved in the HOST's world only (the host's normal saves). This is a test build:
+    back up a save you care about before playing it in co-op (copy its folder from
+    %LOCALAPPDATA%\Mining\Saved\SaveGames).
 
 YOU BOTH NEED
   - Hydroneer from Steam, the same version, and Steam running and logged in.
@@ -48,16 +51,17 @@ EACH TIME YOU PLAY
     1. Double-click Host.bat. A window opens; wait for "lobby ... ready". Leave it open.
        (Steam will show you as "playing Spacewar": that is Steam's free test app that carries
        the connection. Nothing to install or buy.)
-    2. Start Hydroneer from Steam. Start a NEW game (new save slot).
+    2. Start Hydroneer from Steam. Start a new game or load one of your saves.
     3. In the world, press F7. The Host window then says "co-op running, waiting for your friend".
   FRIEND:
-    1. When the host's window says the lobby is ready, double-click Join.bat. It finds your
-       friend's lobby through your Steam friends list. Leave it open.
-       (If it cannot find it: ask the host for the lobby number shown in their window and run
-        Join.bat --lobby <number> from a command prompt in this folder.)
-    2. Start Hydroneer, start a NEW game, and in the world press F7.
-    3. Your character jumps to the host's world position; the host's character appears.
-  BOTH: press F7 right after loading, before anyone digs or moves things.
+    1. When the host's window says the lobby is ready, click Join (or double-click Join.bat). It
+       finds your friend's lobby through your Steam friends list. Leave it open.
+       (If it cannot find it: ask the host for the lobby number shown in their window and put it
+        in the Lobby box, or run Join.bat --lobby <number>.)
+    2. Start Hydroneer and stay at the MAIN MENU. Press F7 there.
+    3. The host's game saves and sends its world (the windows show the progress); your game loads
+       it by itself and you appear in the host's world. You can join again any time: the save
+       slot "CoopNetHost" in your game holds the host's world and is replaced on each join.
 
   To stop: quit Hydroneer, then close the Host/Join window.
 

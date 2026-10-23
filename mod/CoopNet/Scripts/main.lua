@@ -16,12 +16,15 @@
 --              A|name,classpath,x,y,z,pitch,yaw,roll;...  (items with game-made names; the client pairs them)
 --              W|id|fn|world|x|y|z|radius|extra|b1|b2|b3|b4  (a Voxel terrain edit; the client repeats it)
 --              V|id|pickup(1/0)|x|y|z|radius        (a dig; sent 3 times; applied only by hosts without W)
+--              J|text                                 (late join progress, shown to the friend)
+--              N|id|classpath|x|y|z|pitch|yaw|roll|name  (name: the host's own; a late joiner has it already)
+-- client events: J,late (send me your world), L,loaded (the host's world is loaded here)
 --              Z|id|surfaceZ                          (host ground height at that dig, after it)
 --              M|id|name|p1x,p1y,p1z|p2x,p2y,p2z|item@x,y,z;...
 -- Relays prefix "recv_ns|send_ns|" (inbox lines on both sides).
 
 local TAG = "[CoopNet] "
-local MOD_VERSION = "fix5"   -- both players need the same; each side checks the other's
+local MOD_VERSION = "fix6"   -- both players need the same; each side checks the other's
 -- every line also goes to <run>/coopnet-game.log once the run folder is known (one file to send)
 local logfile
 local function log(s)
@@ -75,6 +78,55 @@ local function game_status(msg)
     local f = io.open(cfg.run .. "/status-game.txt", "w")
     if f then f:write(msg .. "\n") f:close() end
 end
+
+-- ---------------------------------------------------------------- late join helpers
+-- In a world: the game mode's InGame? flag. The main menu runs inside the world level and has a
+-- player pawn too, so a pawn says nothing (SaveProbe, NOTES "late join, step 1").
+local function in_game()
+    local v = false
+    pcall(function() local gm = FindFirstOf("GM_Hydroneer_C") v = gm and gm:IsValid() and gm["InGame?"] == true end)
+    return v
+end
+local JOIN_SLOT = "CoopNetHost"                    -- where a late joiner keeps the host's world
+local SAVE_FILES = { "Level.sav", "Player.sav", "SaveData.sav" }
+local function saved_dir()                         -- the game's Saved folder, with a trailing slash
+    local d
+    pcall(function() d = StaticFindObject("/Script/Engine.Default__KismetSystemLibrary"):GetProjectSavedDirectory():ToString() end)
+    return d
+end
+local function copy_file(src, dst)
+    local i = io.open(src, "rb")
+    if not i then return nil end
+    local data = i:read("a")
+    i:close()
+    local o = io.open(dst, "wb")
+    if not o then return nil end
+    o:write(data)
+    o:close()
+    return #data
+end
+local function make_dir(path)                      -- cmd's mkdir (also there under Proton)
+    os.execute('mkdir "' .. (path:gsub("/", "\\")) .. '" 2>nul')
+end
+local function current_slot(ctx)                   -- EasyMultiSave's current slot name
+    local name = nil
+    pcall(function()
+        local out = {}
+        StaticFindObject("/Script/EasyMultiSave.Default__EMSFunctionLibrary"):GetSlotInfoSaveGame(ctx, out)
+        local v = out.SaveGameName or out[1]
+        if v then name = v:ToString() end
+    end)
+    return name
+end
+-- client line counters, shared by the late-join request and the normal client loop (the host
+-- drops lines and events that do not count up)
+local client_seq, client_ev = 0, 1
+local client_out_file = nil
+local function client_outbox()
+    if not client_out_file then client_out_file = io.open(cfg.client_out, "a") end
+    return client_out_file
+end
+local late_joined = false
 
 -- ---------------------------------------------------------------- helpers
 local function name_of(o) if o and o:IsValid() then return o:GetFullName() end return "<none>" end
@@ -488,7 +540,7 @@ end
 local function run_client()
     local OUTBOX, INBOX = cfg.client_out, cfg.client_in
     local RUN = cfg.run
-    local out = io.open(OUTBOX, "w")
+    local out = client_outbox()
     if not out then log("cannot open outbox " .. tostring(OUTBOX)) return end
     local gs = StaticFindObject("/Script/Engine.Default__GameplayStatics")
 
@@ -592,23 +644,63 @@ local function run_client()
     end)
 
     local acc = { fwd = 0, right = 0 }
-    local events, next_id, seq = {}, 1, 0
+    local events, next_id, seq = {}, client_ev, client_seq
     local function push(T, name)
         events[#events + 1] = string.format("%d,%s,%s", next_id, T, name)
         next_id = next_id + 1
         if #events > 8 then table.remove(events, 1) end
     end
+    -- one-off events that must arrive go into every line for ~10 s (a burst of other events once
+    -- pushed the "loaded" event out of the last 8 before it was ever sent)
+    local sticky = {}
+    local function push_sticky(T, name)
+        sticky[#sticky + 1] = { s = string.format("%d,%s,%s", next_id, T, name), left = 300 }
+        next_id = next_id + 1
+    end
+    function client_events_line()
+        local t = {}
+        for i = #sticky, 1, -1 do
+            sticky[i].left = sticky[i].left - 1
+            if sticky[i].left < 0 then table.remove(sticky, i) end
+        end
+        for _, e in ipairs(sticky) do t[#t + 1] = e.s end
+        for _, e in ipairs(events) do t[#t + 1] = e end
+        return table.concat(t, ";")
+    end
+    -- input hooks fire for every character, the puppet too: count only our own pawn's
+    -- (after a late join the puppet's jump/crouch events filled the event list)
+    local others = 0
+    local own_name, own_name_t = nil, -1
+    local function mine(self)
+        -- by full name (a GetAddress comparison failed silently and dropped all our own input)
+        local ok, yes = pcall(function()
+            if not (pc and pc.Pawn and pc.Pawn:IsValid()) then return false end
+            if os.clock() - own_name_t > 0.5 then own_name, own_name_t = pc.Pawn:GetFullName(), os.clock() end
+            return self:get():GetFullName() == own_name
+        end)
+        if ok and yes then return true end
+        others = others + 1
+        if others <= 3 or others % 2000 == 0 then
+            local who = "?"
+            pcall(function() who = self:get():GetFullName():match("[^.]+$") end)
+            log(string.format("input from another character ignored (%d so far): %s, ours %s%s", others, who,
+                tostring(own_name and own_name:match("[^.]+$")), ok and "" or (" (check failed: " .. tostring(yes) .. ")")))
+        end
+        return false
+    end
     local function axis_hook(field)
         return function(self, v)
+            if not mine(self) then return end
             local x = v:get()
             if math.abs(x) > math.abs(acc[field]) then acc[field] = x end
         end
     end
-    push("V", MOD_VERSION)   -- our version for the host (repeats with the last 8 events)
+    push_sticky("V", MOD_VERSION)   -- our version for the host
+    if late_joined then push_sticky("L", "loaded") end   -- the host then repeats terrain edits made after its save
     RegisterHook(CHAR .. "InpAxisEvt_MoveForward_K2Node_InputAxisEvent_0", axis_hook("fwd"))
     RegisterHook(CHAR .. "InpAxisEvt_MoveRight_K2Node_InputAxisEvent_1", axis_hook("right"))
     for _, fname in ipairs(PAWN_ACTIONS) do
-        pcall(function() RegisterHook(CHAR .. fname, function() push("P", fname) end) end)
+        pcall(function() RegisterHook(CHAR .. fname, function(self) if mine(self) then push("P", fname) end end) end)
     end
 
     -- 2) poll world-action keys (edges -> down/up events that are only sent)
@@ -986,6 +1078,17 @@ local function run_client()
             mirror_carry()
         elseif kind == "N" then
             local id, cp, x, y, z, p, yw, r = rest:match("^(N%d+)|([^|]+)|([%-%d%.]+)|([%-%d%.]+)|([%-%d%.]+)|([%-%d%.]+)|([%-%d%.]+)|([%-%d%.]+)")
+            local hname = rest:match("^N%d+|[^|]+|[^|]+|[^|]+|[^|]+|[^|]+|[^|]+|[^|]+|([%w_]+)$")
+            if id and not spawned[id] and hname then
+                -- after a late join the item came with the host's save, under the host's name
+                local ex = item_by_name[hname]
+                if not (ex and ex:IsValid()) then rebuild_items() ex = item_by_name[hname] end
+                if ex and ex:IsValid() and not id_by_fname[hname] then
+                    spawned[id] = ex
+                    id_by_fname[hname] = id
+                    log(string.format("runtime item %s is our %s (from the host's save)", id, hname))
+                end
+            end
             if id and not spawned[id] and pc then
                 spawn_copy(id, cp, vec(tonumber(x), tonumber(y), tonumber(z)),
                     { Pitch = tonumber(p), Yaw = tonumber(yw), Roll = tonumber(r) })
@@ -1091,6 +1194,13 @@ local function run_client()
             snd_stats.played = snd_stats.played + (ok and 1 or 0)
             if not ok or snd_stats.played <= 20 or snd_stats.played % 50 == 0 then
                 log(string.format("sound %s for %s: %s%s", id, tag, path:match("([^/]+)$") or path, ok and "" or (" FAILED " .. tostring(err))))
+            end
+        elseif kind == "P" then
+            local x, y, z, hz = rest:match("^([%-%d%.]+)|([%-%d%.]+)|([%-%d%.]+)|([%-%d%.]+)")
+            if x then
+                local cz = surface_z(pc, tonumber(x), tonumber(y), tonumber(z) + 1000, tonumber(z) - 1000)
+                log(string.format("cmp predig (dug on the host before its save): host ground %.1f, client ground %s, diff %s cm",
+                    tonumber(hz), tostring(cz and string.format("%.1f", cz)), cz and string.format("%.1f", math.abs(cz - tonumber(hz))) or "?"))
             end
         elseif kind == "T" then
             local name, st = rest:match("^([%w_]+)|(.*)$")
@@ -1250,7 +1360,7 @@ local function run_client()
                 local r = pc:GetControlRotation()
                 seq = seq + 1
                 out:write(string.format("%d|%.3f|%.3f|%.2f|%.2f|%s\n", seq, acc.fwd, acc.right, r.Pitch, r.Yaw,
-                    table.concat(events, ";")))
+                    client_events_line()))
                 out:flush()
                 last_axes.fwd, last_axes.right = acc.fwd, acc.right
                 acc.fwd, acc.right = 0, 0
@@ -1778,6 +1888,7 @@ local function run_host()
     local function send(line) out:write(line .. "\n") out:flush() end
     local friend_version = nil
     local held_prev = {}
+    local predig = nil           -- test only: a dig made before a late joiner's save
     -- a new id each time co-op starts on the host: the client notices a restarted host
     local session = string.format("%x%06x", os.time(), math.random(0, 0xffffff))
     log("host session " .. session)
@@ -1799,6 +1910,7 @@ local function run_host()
     -- every such call as it happens, whoever made it; the client makes the same call.
     --   W|id|fn|world|x|y|z|radius|extra|b1|b2|b3|b4   (extra: Value, or Min:Max for durability)
     local voxel_ok, voxel_id = 0, 0
+    local edits_log = {}         -- id -> W line, to repeat edits made after a late joiner's save
     local function arg(p) local v = nil pcall(function() v = p:get() end) return v end
     for fn, layout in pairs({ AddSphere = { 3, nil }, RemoveSphere = { 3, nil }, SetValueSphere = { 3, "value" },
                               RemoveSphereWithDurability = { 3, "interval" },
@@ -1822,6 +1934,7 @@ local function run_host()
                     local line = string.format("W|%d|%s|%s|%.2f|%.2f|%.2f|%.2f|%s|%s", voxel_id, base, world,
                         pos.X, pos.Y, pos.Z, rad, extra, table.concat(bs, "|"))
                     log(string.format("terrain edit %d: %s %s at %.0f,%.0f,%.0f r=%.1f %s", voxel_id, fn, world, pos.X, pos.Y, pos.Z, rad, extra))
+                    edits_log[voxel_id] = line
                     send_repeat(line)
                 end)
                 if not ok2 then log("terrain edit hook " .. fn .. " failed: " .. tostring(err2)) end
@@ -1902,12 +2015,12 @@ local function run_host()
                         net_count = net_count + 1
                         local id = "N" .. net_count
                         net_name[n] = id
-                        runtime[#runtime + 1] = { id = id, it = p.it, cp = class_path(p.it) }
+                        runtime[#runtime + 1] = { id = id, it = p.it, cp = class_path(p.it), fname = n }
                         all_items[#all_items + 1] = { it = p.it, n = n }
                         local l, r = loc_of(p.it), rot_of(p.it)
                         local cp = class_path(p.it)
                         log(string.format("runtime item %s = %s (%s) at %s", id, n, cp, fmt(l)))
-                        send_repeat(string.format("N|%s|%s|%.1f|%.1f|%.1f|%.1f|%.1f|%.1f", id, cp, l.X, l.Y, l.Z, r.Pitch, r.Yaw, r.Roll))
+                        send_repeat(string.format("N|%s|%s|%.1f|%.1f|%.1f|%.1f|%.1f|%.1f|%s", id, cp, l.X, l.Y, l.Z, r.Pitch, r.Yaw, r.Roll, n))
                         last_sent[n] = { X = l.X, Y = l.Y, Z = l.Z, Yaw = r.Yaw, Pitch = r.Pitch }
                         stats.spawned = (stats.spawned or 0) + 1
                     end
@@ -2038,7 +2151,7 @@ local function run_host()
         for _, r in ipairs(runtime) do
             if alive(r.it) then
                 local l, ro = loc_of(r.it), rot_of(r.it)
-                send(string.format("N|%s|%s|%.1f|%.1f|%.1f|%.1f|%.1f|%.1f", r.id, r.cp, l.X, l.Y, l.Z, ro.Pitch, ro.Yaw, ro.Roll))
+                send(string.format("N|%s|%s|%.1f|%.1f|%.1f|%.1f|%.1f|%.1f|%s", r.id, r.cp, l.X, l.Y, l.Z, ro.Pitch, ro.Yaw, ro.Roll, r.fname))
             end
         end
         for w in pairs(gone) do send("X|" .. w) end
@@ -2092,8 +2205,71 @@ local function run_host()
         return table.concat(parts), table.concat(g, ",")
     end
 
+    -- late join: save the world, put the files where the relay sends them from
+    local join = { busy = false, last = -1e9, mark = 0, late = false }
+    local function save_for_join()
+        if join.busy or os.clock() - join.last < 20 then return end
+        join.busy, join.last, join.late = true, os.clock(), true
+        local slot = current_slot(pc1)
+        if not slot then
+            log("late join: no current save slot")
+            send("J|in a world it cannot save (no save slot)")
+            join.busy = false
+            return
+        end
+        log("late join: the friend asks for the world; saving slot " .. slot)
+        game_status("host: your friend is joining; saving and sending your world ...")
+        send("J|saving its world")
+        join.mark = voxel_id
+        pc1:Autosave()
+        local ems = StaticFindObject("/Script/EasyMultiSave.Default__EMSFunctionLibrary")
+        local t0 = os.clock()
+        game_loop(500, function()
+            local busy = true
+            pcall(function() busy = ems:IsSavingOrLoading(pc1) end)
+            if os.clock() - t0 < 3 or (busy and os.clock() - t0 < 60) then return false end
+            local sd = saved_dir()
+            local src = sd and (sd .. "SaveGames/" .. slot .. "/")
+            make_dir(cfg.run .. "/save_out")
+            local names, total = {}, 0
+            for _, n in ipairs(SAVE_FILES) do
+                local sz = src and copy_file(src .. n, cfg.run .. "/save_out/" .. n)
+                if sz then names[#names + 1] = n total = total + sz end
+            end
+            if #names == 0 then
+                log("late join: cannot read the save in " .. tostring(src))
+                send("J|unable to read its save")
+                join.busy = false
+                return true
+            end
+            local ready = cfg.run .. "/save_out.ready"
+            local f = io.open(ready .. ".part", "w")
+            f:write(slot .. "\n" .. table.concat(names, "\n") .. "\n")
+            f:close()
+            os.remove(ready)
+            os.rename(ready .. ".part", ready)
+            log(string.format("late join: %d files (%.1f MB) of slot %s ready for the relay; terrain edits after id %d will be repeated",
+                #names, total / 1e6, slot, join.mark))
+            send(string.format("J|sending its world (%.1f MB)", total / 1e6))
+            join.busy = false
+            return true
+        end)
+    end
+
     local function apply_event(T, name)
         stats.events = stats.events + 1
+        if T == "J" then save_for_join() return end
+        if T == "L" then
+            local n = 0
+            for id = join.mark + 1, voxel_id do
+                if edits_log[id] then send(edits_log[id]) n = n + 1 end
+            end
+            log(string.format("late join: the friend loaded our world; repeated %d terrain edits made since the save", n))
+            game_status("host: your friend is in your world")
+            if predig then send(string.format("P|%.1f|%.1f|%.1f|%.1f", predig.X, predig.Y, predig.Z, predig.ground)) end
+            if cfg.bot then later(3000, host_bot) end
+            return
+        end
         if T == "V" then
             friend_version = name
             log("friend's CoopNet version: " .. name .. " (ours " .. MOD_VERSION .. ")")
@@ -2270,7 +2446,7 @@ local function run_host()
             end)
         end)
     end
-    local function host_bot()
+    function host_bot()
         marker("h_start")
         log("calling GM_Hydroneer.SpawnInitialItems() (the game's starter-item spawn)")
         FindFirstOf("GM_Hydroneer_C"):SpawnInitialItems()
@@ -2324,15 +2500,171 @@ local function run_host()
                     game_status("host: your friend runs an OLDER CoopNet (before fix5), you run " .. MOD_VERSION .. ". Both need the same fix")
                 end
             end)
-            if cfg.bot then later(3000, host_bot) end
+            if cfg.bot and not join.late then later(3000, host_bot) end
             return true
         end
         return false
     end)
+    -- test only: change the world before a late joiner comes (items made after F7, one dig), so the
+    -- test proves the friend gets them through the save
+    if cfg.mode ~= "play" and os.getenv("HYDRO_COOP_TEST_PREWORLD") == "1" then
+        later(4000, function()
+            log("preworld test: SpawnInitialItems() and one dig before the friend joins")
+            FindFirstOf("GM_Hydroneer_C"):SpawnInitialItems()
+            -- a real dig by P1 with the starter shovel: a Lua RemoveSphere is not kept in the save
+            -- (first late-join run: the friend's ground stayed 11.6 cm higher); the game's own dig is
+            local shovel
+            for _, it in ipairs(FindAllOf("BP_ShovelT1_C") or {}) do
+                if short(it):match("_C_%d+$") and not shovel then shovel = it end
+            end
+            if not shovel then log("preworld test: no starter shovel") return end
+            -- from the far side (the friend's bot comes from +X later), after the new items settled
+            later(3000, function()
+            local sl = loc_of(shovel)
+            pc1.Pawn:K2_TeleportTo(vec(sl.X - 120, sl.Y, sl.Z + 60), { Pitch = 0, Yaw = 0, Roll = 0 })
+            later(1000, function()
+                aim_pc(pc1, loc_of(shovel))
+                later(600, function()
+                    aim_pc(pc1, loc_of(shovel))
+                    tap1("InpActEvt_Pickup_K2Node_InputActionEvent_12", "InpActEvt_Pickup_K2Node_InputActionEvent_13")
+                    later(1500, function()
+                        log("preworld test: P1 picked up " .. tostring((carried_name(pc1))) .. " (" .. short(shovel) .. " wanted)")
+                        local x, y = 22700, 6100
+                        local z0 = surface_z(pc1, x, y, 2000, -2000)
+                        if not z0 then log("preworld test: no ground at the dig spot") return end
+                        -- the friend's bot's dig approach: 1.5 m off, 1.2 m up, aim, click (twice if needed)
+                        pc1.Pawn:K2_TeleportTo(vec(x + 150, y, z0 + 120), { Pitch = 0, Yaw = 180, Roll = 0 })
+                        later(1500, function()
+                            aim_pc(pc1, vec(x, y, z0))
+                            later(800, function()
+                                aim_pc(pc1, vec(x, y, z0))
+                                log("preworld test: P1 carries " .. tostring((carried_name(pc1))) .. ", digging at " .. x .. "," .. y)
+                                tap1("InpActEvt_LMB_K2Node_InputActionEvent_5", "InpActEvt_LMB_K2Node_InputActionEvent_6")
+                                later(1500, function()
+                                    local zc = surface_z(pc1, x, y, 2000, -2000)
+                                    if zc and math.abs(zc - z0) < 1 then
+                                        log("preworld test: no change after the first click, clicking again")
+                                        aim_pc(pc1, vec(x, y, z0))
+                                        tap1("InpActEvt_LMB_K2Node_InputActionEvent_5", "InpActEvt_LMB_K2Node_InputActionEvent_6")
+                                        later(1000, function()
+                                            local zd = surface_z(pc1, x, y, 2000, -2000)
+                                            if zd and math.abs(zd - z0) < 1 then
+                                                log("preworld test: still no change, third click from closer")
+                                                pc1.Pawn:K2_TeleportTo(vec(x + 110, y, z0 + 110), { Pitch = 0, Yaw = 180, Roll = 0 })
+                                                later(800, function()
+                                                    aim_pc(pc1, vec(x, y, z0))
+                                                    tap1("InpActEvt_LMB_K2Node_InputActionEvent_5", "InpActEvt_LMB_K2Node_InputActionEvent_6")
+                                                end)
+                                            end
+                                        end)
+                                    end
+                                end)
+                                later(5500, function()
+                                    local z1 = surface_z(pc1, x, y, 2000, -2000)
+                                    predig = { X = x, Y = y, Z = z0, ground = z1 or -1 }
+                                    log(string.format("preworld test: P1 dug at %d,%d: ground %.1f -> %s", x, y, z0, tostring(z1 and string.format("%.1f", z1))))
+                                    -- out of the friend's bot's way
+                                    pc1.Pawn:K2_TeleportTo(vec(x + 900, y - 600, z0 + 150), { Pitch = 0, Yaw = 0, Roll = 0 })
+                                end)
+                            end)
+                        end)
+                    end)
+                end)
+            end)
+            end)
+        end)
+    end
     game_status("host: co-op running, waiting for your friend to press F7")
     local f = io.open(cfg.ready, "w")
     if f then f:write("ready\n") f:close() end
     log("host ready")
+end
+
+-- ================================================================ late join (client)
+-- At the main menu: ask the host for its world, wait for the relay to bring the save, copy it into
+-- our CoopNetHost slot, load it the way the save manager does, then start the normal client.
+local function load_slot(slot, after)
+    local gm = FindFirstOf("GM_Hydroneer_C")
+    StaticFindObject("/Script/EasyMultiSave.Default__EMSFunctionLibrary"):SetCurrentSaveGameName(gm, slot)
+    -- Continue opens the save manager; there: select the slot and continue
+    FindFirstOf("UI_MainMenu_C"):BndEvt__UI_MainMenu_ContinueButton_1_K2Node_ComponentBoundEvent_14_OnButtonClickedEvent__DelegateSignature()
+    later(2500, function()
+        local sm = FindFirstOf("UI_Menu_SaveManager_C")
+        if not (sm and sm:IsValid()) then
+            log("late join: the save manager did not open")
+            game_status("client: could not open the game's save manager; load the save 'CoopNetHost' yourself, then press F7")
+            return
+        end
+        sm:SaveSelected(slot)
+        later(1500, function()
+            sm:ContinueMainGame()
+            local t0 = os.clock()
+            game_loop(500, function()
+                if in_game() then
+                    log("late join: the host's world is loaded")
+                    later(6000, after)
+                    return true
+                end
+                if os.clock() - t0 > 180 then
+                    log("late join: the world did not load in 3 minutes")
+                    game_status("client: the host's world did not load; load the save 'CoopNetHost' yourself, then press F7")
+                    return true
+                end
+                return false
+            end)
+        end)
+    end)
+end
+
+local function late_join(start_client)
+    log("late join: asking the host for its world")
+    game_status("client: asking the host for its world ...")
+    local out = client_outbox()
+    local read_status = line_reader(cfg.client_in)
+    local ready = cfg.run .. "/save_in.ready"
+    local asked_at, t0, ev = -1e9, os.clock(), client_ev
+    client_ev = client_ev + 2      -- the join request and our version
+    game_loop(250, function()
+        -- the request goes out every 2 s until the save is here (the host ignores repeats)
+        if os.clock() - asked_at > 2 then
+            asked_at = os.clock()
+            client_seq = client_seq + 1
+            out:write(string.format("%d|0.000|0.000|0.00|0.00|%d,J,late;%d,V,%s\n", client_seq, ev, ev + 1, MOD_VERSION))
+            out:flush()
+        end
+        read_status(function(line)
+            local st = line:match("^%d+|%d+|J|(.*)$")
+            if st then log("host: " .. st) game_status("client: the host is " .. st) end
+        end)
+        local f = io.open(ready, "r")
+        if f then
+            local slot = f:read("l")
+            local names = {}
+            for l in f:lines() do if l ~= "" then names[#names + 1] = l end end
+            f:close()
+            os.remove(ready)
+            local sd = saved_dir()
+            local dst = sd and (sd .. "SaveGames/" .. JOIN_SLOT .. "/")
+            if not dst then log("late join: no Saved folder") game_status("client: cannot find the game's save folder") return true end
+            make_dir(dst)
+            local copied, total = 0, 0
+            for _, n in ipairs(names) do
+                local sz = copy_file(cfg.run .. "/save_in/" .. n, dst .. n)
+                if sz then copied, total = copied + 1, total + sz else log("late join: could not write " .. dst .. n) end
+            end
+            log(string.format("late join: host slot %s, %d of %d files (%.1f MB) copied to %s", tostring(slot), copied, #names, total / 1e6, dst))
+            if copied < #names then game_status("client: could not store the host's world in the save folder") return true end
+            game_status("client: loading the host's world ...")
+            load_slot(JOIN_SLOT, start_client)
+            return true
+        end
+        if os.clock() - t0 > 300 then
+            log("late join: no world from the host after 5 minutes")
+            game_status("client: no world from the host after 5 minutes. Is the host in a world with co-op running (F7)?")
+            return true
+        end
+        return false
+    end)
 end
 
 -- ================================================================ startup
@@ -2348,6 +2680,20 @@ local function start_coop()
             return
         end
         ROLE = r
+    end
+    if not in_game() then
+        if ROLE == "client" then
+            -- at the main menu: join late, in the host's world
+            started = true
+            late_join(function()
+                late_joined = true
+                log("starting co-op as client (late join)")
+                run_client()
+            end)
+        else
+            game_status("F7 pressed at the main menu: the host starts or loads a world first, then presses F7")
+        end
+        return
     end
     local pc = controllers()[1]
     if not (pc and pc.Pawn and pc.Pawn:IsValid()) then
@@ -2370,12 +2716,20 @@ if cfg.mode == "play" then
         local ok, err = pcall(start_coop)
         if not ok then log("start failed: " .. tostring(err)) end
     end) end)
-    game_status("mod loaded: start Host.bat or Join.bat, start a NEW game, then press F7 in the world")
+    game_status("mod loaded: host: load a world and press F7; friend: press F7 at the main menu to join")
 else
-    -- harness: start a new game, then do what F7 does
-    later(20000, function()
-        log("NewGame on " .. tostring(ROLE or "?"))
-        FindFirstOf("GM_Hydroneer_C"):NewGame()
-        later(60000, start_coop)
-    end)
+    -- harness: start a new game, then do what F7 does (a late-joining test client stays at the
+    -- menu and presses "F7" there)
+    if os.getenv("HYDRO_COOP_LATEJOIN") == "1" then
+        later(45000, function()
+            log("late join test: F7 at the main menu")
+            start_coop()
+        end)
+    else
+        later(20000, function()
+            log("NewGame on " .. tostring(ROLE or "?"))
+            FindFirstOf("GM_Hydroneer_C"):NewGame()
+            later(60000, start_coop)
+        end)
+    end
 end

@@ -5,6 +5,12 @@ sends each line to the peer as "<send_ns>|<line>" and appends what it receives t
 RUN/from_net.txt as "<recv_ns>|<send_ns>|<line>". It also writes RUN/role.txt (host|client)
 for the mod and prints a status line.
 
+Late join: the host's mod puts its save in RUN/save_out/ and lists it in RUN/save_out.ready
+(slot name, then one file name per line). The relay sends those files to the client's relay in
+48 KB chunks with acks and resends (the save is ~21 MB and does not compress: EasyMultiSave
+already compresses it), checks each file's SHA-256, and writes them to RUN/save_in/ plus
+RUN/save_in.ready for the client's mod.
+
 Transports:
   udp        direct UDP (host listens on --port; client sends to --host-addr:--port)
   steam      Steam lobbies + ISteamNetworkingMessages as AppID 480 (Spacewar), through
@@ -18,8 +24,10 @@ Usage: python coopnet_relay.py --role host|client --transport steam|udp|mockstea
 """
 import argparse
 import ctypes
+import hashlib
 import json
 import os
+import random
 import socket
 import sys
 import time
@@ -54,7 +62,8 @@ class Log:
 
 # ---------------------------------------------------------------- transports
 # Each transport: start(), pump() -> list[bytes] (game data received), send(bytes),
-# connected() -> bool, describe() -> str, close().
+# connected() -> bool, describe() -> str, close(); and for the save transfer
+# send_bulk(bytes) -> bool (False: try again later) and bulk_in (list of received bulk messages).
 
 class UdpTransport:
     def __init__(self, args, log):
@@ -69,6 +78,7 @@ class UdpTransport:
             self.peer = (args.host_addr, args.port)
         self.last_rx = 0.0
         self.last_ka = 0.0
+        self.bulk_in = []
 
     def start(self):
         self.log(f"udp transport, role {self.role}, " +
@@ -85,12 +95,20 @@ class UdpTransport:
                 self.peer = addr
                 self.log(f"client address {addr}")
             self.last_rx = time.monotonic()
-            if data != b"K":
+            if data[:1] == b"\x00":
+                self.bulk_in.append(data[1:])
+            elif data != b"K":
                 out.append(data)
         if self.peer and time.monotonic() - self.last_ka > KEEPALIVE_S:
             self.last_ka = time.monotonic()
             self._raw(b"K")
         return out
+
+    def send_bulk(self, data):
+        if not self.peer:
+            return False
+        self._raw(b"\x00" + data)
+        return True
 
     def _raw(self, data):
         try:
@@ -163,6 +181,10 @@ class SteamApi:
         self.MsgRelease = f("SteamAPI_SteamNetworkingMessage_t_Release", None, vp)
         self.SteamNU = f("SteamAPI_SteamNetworkingUtils_SteamAPI_v004", vp)
         self.InitRelay = f("SteamAPI_ISteamNetworkingUtils_InitRelayNetworkAccess", None, vp)
+        try:   # ESteamNetworkingConfigValue values checked in Steamworks.NET 2025.164.1's metadata
+            self.SetConfigInt = f("SteamAPI_ISteamNetworkingUtils_SetGlobalConfigValueInt32", b, vp, i32, i32)
+        except AttributeError:
+            self.SetConfigInt = None
 
     def identity(self, steamid):
         buf = ctypes.create_string_buffer(160)   # SteamNetworkingIdentity is 136 bytes; opaque
@@ -218,6 +240,7 @@ class SteamTransport:
         self.last_ka = 0.0
         self.pending_calls = {}
         self.sender_offset = None
+        self.bulk_in = []
 
     # -- setup
     def start(self):
@@ -234,6 +257,13 @@ class SteamTransport:
         self.nm, self.nu = a.SteamNM(), a.SteamNU()
         self.me = a.GetSteamID(self.user)
         a.InitRelay(self.nu)
+        # room and rate for the save transfer (defaults are a few hundred KB): send buffer 4 MB,
+        # rate 512 KB/s to 8 MB/s. ESteamNetworkingConfigValue: SendBufferSize 9, SendRateMin 10, SendRateMax 11
+        if a.SetConfigInt:
+            for key, val in ((9, 4 * 1024 * 1024), (10, 512 * 1024), (11, 8 * 1024 * 1024)):
+                ok = a.SetConfigInt(self.nu, key, val)
+                if not ok:
+                    self.log(f"could not set Steam networking config {key} (save transfer may be slower)")
         name = (a.GetPersonaName(self.fr) or b"?").decode(errors="replace")
         self.log(f"steam transport as AppID 480 (Spacewar), signed in as {name} ({self.me})")
         if self.role == "host":
@@ -364,11 +394,14 @@ class SteamTransport:
     # -- messages
     def _send(self, data, channel, flags):
         if not self.peer:
-            return
+            return 0
         a = self.api
         ident = a.identity(self.peer)
         buf = ctypes.create_string_buffer(data, len(data))
-        a.SendToUser(self.nm, ident, buf, len(data), flags, channel)
+        return a.SendToUser(self.nm, ident, buf, len(data), flags, channel)
+
+    def send_bulk(self, data):
+        return self._send(data, 2, self.SEND_RELIABLE) == 1      # 1 = k_EResultOK
 
     def _control(self, data):
         self._send(data, 1, self.SEND_RELIABLE)
@@ -405,6 +438,10 @@ class SteamTransport:
             self.last_rx = time.monotonic()
             if c == b"BYE":
                 self.log("the other player closed their relay")
+        bulk = self._receive(2)
+        if bulk:
+            self.last_rx = time.monotonic()
+            self.bulk_in.extend(bulk)
         data = self._receive(0)
         if data:
             self.last_rx = time.monotonic()
@@ -450,6 +487,7 @@ class MockSteamTransport:
         self.lobby, self.peer, self.peer_port = 0, 0, None
         self.accepted, self.held = set(), {}
         self.last_rx = self.last_ka = 0.0
+        self.bulk_in = []
 
     def start(self):
         self.log(f"mocksteam transport, id {self.me}, port {self.sock.getsockname()[1]}")
@@ -478,6 +516,9 @@ class MockSteamTransport:
             self._raw(1, b"HELLO")
 
     def _raw(self, channel, data):
+        # test only: lose a share of the save-transfer messages (--mock-drop), to exercise resends
+        if channel == 2 and self.args.mock_drop and random.random() < self.args.mock_drop:
+            return
         if self.peer_port:
             hdr = self.me.to_bytes(8, "little") + bytes([channel]) + self.sock.getsockname()[1].to_bytes(2, "little")
             try:
@@ -509,6 +550,8 @@ class MockSteamTransport:
             self.last_rx = time.monotonic()
             if channel == 0:
                 out.append(data)
+            elif channel == 2:
+                self.bulk_in.append(data)
         if self.peer and time.monotonic() - self.last_ka > KEEPALIVE_S:
             self.last_ka = time.monotonic()
             self._raw(1, b"K")
@@ -516,6 +559,12 @@ class MockSteamTransport:
 
     def send(self, data):
         self._raw(0, data)
+
+    def send_bulk(self, data):
+        if not self.peer_port:
+            return False
+        self._raw(2, data)
+        return True
 
     def connected(self):
         return bool(self.peer) and time.monotonic() - self.last_rx < PEER_TIMEOUT_S
@@ -528,6 +577,141 @@ class MockSteamTransport:
         if self.role == "host" and os.path.exists(self.reg):
             os.remove(self.reg)
         self.sock.close()
+
+
+# ---------------------------------------------------------------- save transfer (late join)
+# Messages on the bulk channel:
+#   H + json {"tid", "slot", "files": [[name, size, sha256], ...], "chunks"}   header
+#   C + tid(4) + index(4) + payload                                         chunk (48 KB)
+#   A + tid(4) + index(4, 0xFFFFFFFF = header)                              ack
+#   D + tid(4)                                                              all files written
+# Unacked messages are sent again after 1 s, so it works over lossy test transports too.
+CHUNK = 48 * 1024
+WINDOW = 8
+RESEND_S = 1.0
+
+
+class SaveSender:
+    def __init__(self, t, log, tid, slot, files):
+        self.t, self.log, self.tid = t, log, tid
+        self.blob = b"".join(d for _, d in files)
+        self.n = (len(self.blob) + CHUNK - 1) // CHUNK
+        meta = [[name, len(d), hashlib.sha256(d).hexdigest()] for name, d in files]
+        self.header = b"H" + json.dumps({"tid": tid, "slot": slot, "files": meta, "chunks": self.n}).encode()
+        self.header_acked = False
+        self.sent_at = {}            # chunk index -> time sent (unacked)
+        self.acked = set()
+        self.next = 0
+        self.last_header = 0.0
+        self.done = False
+        self.t0 = time.monotonic()
+        self.last_report = 0.0
+        log(f"save transfer {tid}: slot {slot}, {len(files)} files, {len(self.blob) / 1e6:.1f} MB in {self.n} chunks")
+
+    def _chunk(self, i):
+        return b"C" + self.tid.to_bytes(4, "little") + i.to_bytes(4, "little") + self.blob[i * CHUNK:(i + 1) * CHUNK]
+
+    def on_msg(self, m):
+        if m[:1] == b"A" and int.from_bytes(m[1:5], "little") == self.tid:
+            i = int.from_bytes(m[5:9], "little")
+            if i == 0xFFFFFFFF:
+                self.header_acked = True
+            else:
+                self.acked.add(i)
+                self.sent_at.pop(i, None)
+        elif m[:1] == b"D" and int.from_bytes(m[1:5], "little") == self.tid:
+            self.done = True
+            self.log(f"save transfer {self.tid}: the friend has the save ({time.monotonic() - self.t0:.0f} s)")
+
+    def tick(self):
+        now = time.monotonic()
+        if not self.header_acked:
+            if now - self.last_header > RESEND_S:
+                self.last_header = now
+                self.t.send_bulk(self.header)
+            return
+        # resend what was not acked in time, then fill the window with new chunks
+        for i, ts in list(self.sent_at.items()):
+            if now - ts > RESEND_S:
+                if self.t.send_bulk(self._chunk(i)):
+                    self.sent_at[i] = now
+        while len(self.sent_at) < WINDOW and self.next < self.n:
+            if not self.t.send_bulk(self._chunk(self.next)):
+                break                                    # Steam's buffer is full: next tick
+            self.sent_at[self.next] = now
+            self.next += 1
+        if now - self.last_report > 3:
+            self.last_report = now
+            self.log(f"sending save: {100 * len(self.acked) // max(1, self.n)}% "
+                     f"({len(self.acked) * CHUNK / 1e6:.1f} of {len(self.blob) / 1e6:.1f} MB)")
+
+
+class SaveReceiver:
+    def __init__(self, t, log, run_dir):
+        self.t, self.log, self.run_dir = t, log, run_dir
+        self.cur = None              # tid, meta, buffer, have
+        self.finished = set()
+        self.last_report = 0.0
+
+    def _ack(self, tid, i):
+        self.t.send_bulk(b"A" + tid.to_bytes(4, "little") + i.to_bytes(4, "little"))
+
+    def on_msg(self, m):
+        kind = m[:1]
+        if kind == b"H":
+            meta = json.loads(m[1:].decode())
+            tid = meta["tid"]
+            self._ack(tid, 0xFFFFFFFF)
+            if tid in self.finished:
+                self.t.send_bulk(b"D" + tid.to_bytes(4, "little"))
+                return
+            if not self.cur or self.cur["tid"] != tid:
+                total = sum(f[1] for f in meta["files"])
+                self.cur = {"tid": tid, "meta": meta, "buf": bytearray(total), "have": set(), "t0": time.monotonic()}
+                self.log(f"receiving the host's save (slot {meta['slot']}, {total / 1e6:.1f} MB)")
+        elif kind == b"C" and self.cur:
+            tid, i = int.from_bytes(m[1:5], "little"), int.from_bytes(m[5:9], "little")
+            if tid != self.cur["tid"]:
+                return
+            self._ack(tid, i)
+            if i not in self.cur["have"]:
+                payload = m[9:]
+                self.cur["buf"][i * CHUNK:i * CHUNK + len(payload)] = payload
+                self.cur["have"].add(i)
+            now = time.monotonic()
+            n = self.cur["meta"]["chunks"]
+            if now - self.last_report > 3:
+                self.last_report = now
+                self.log(f"receiving save: {100 * len(self.cur['have']) // max(1, n)}%")
+            if len(self.cur["have"]) == n:
+                self._finish()
+
+    def _finish(self):
+        c = self.cur
+        meta, buf = c["meta"], bytes(c["buf"])
+        out = os.path.join(self.run_dir, "save_in")
+        os.makedirs(out, exist_ok=True)
+        pos, names = 0, []
+        for name, size, sha in meta["files"]:
+            data = buf[pos:pos + size]
+            pos += size
+            if hashlib.sha256(data).hexdigest() != sha or os.path.basename(name) != name:
+                self.log(f"save transfer: {name} arrived damaged; asking again")
+                self.cur = None
+                return
+            with open(os.path.join(out, name + ".part"), "wb") as f:
+                f.write(data)
+            os.replace(os.path.join(out, name + ".part"), os.path.join(out, name))
+            names.append(name)
+        ready = os.path.join(self.run_dir, "save_in.ready")
+        with open(ready + ".part", "w", encoding="utf-8", newline="\n") as f:
+            f.write(meta["slot"] + "\n" + "\n".join(names) + "\n")
+        os.replace(ready + ".part", ready)
+        self.finished.add(c["tid"])
+        self.t.send_bulk(b"D" + c["tid"].to_bytes(4, "little"))
+        self.log(f"got the host's save: {len(names)} files, all SHA-256 checked "
+                 f"({time.monotonic() - c['t0']:.0f} s); the game loads it now")
+        self.cur = None
 
 
 # ---------------------------------------------------------------- relay loop
@@ -545,6 +729,7 @@ def main():
     p.add_argument("--dll")
     p.add_argument("--mock-id", type=int, default=1)
     p.add_argument("--mock-dir", default=".")
+    p.add_argument("--mock-drop", type=float, default=0.0, help="test only: share of save-transfer messages the mock transport loses")
     p.add_argument("--max-seconds", type=float, default=0, help="test: stop after this long")
     p.add_argument("--stop-file", help="stop cleanly (leave the lobby, sign off) when this file appears")
     args = p.parse_args()
@@ -558,6 +743,12 @@ def main():
     # then tell the mod our role
     for path in (to_net, from_net, game_status):
         open(path, "w").close()
+    # no half-finished save transfer from an earlier session
+    for name in ("save_out.ready", "save_out.sent", "save_in.ready"):
+        try:
+            os.remove(os.path.join(args.run_dir, name))
+        except OSError:
+            pass
     with open(os.path.join(args.run_dir, "role.txt"), "w") as f:
         f.write(args.role + "\n")
 
@@ -580,6 +771,9 @@ def main():
     if args.stop_file and os.path.exists(args.stop_file):
         os.remove(args.stop_file)          # a stop request left over from an earlier session
     last_game = ""
+    sender, receiver, next_tid = None, SaveReceiver(t, log, args.run_dir), int(time.time()) & 0x7FFFFFFF
+    save_out_ready = os.path.join(args.run_dir, "save_out.ready")
+    last_save_check = 0.0
     log("relay running. Leave this window open while you play; close it to stop co-op.")
     try:
         while True:
@@ -592,6 +786,38 @@ def main():
                 inbox.write(f"{now_ns()}|{text}\n")
                 recv += 1
             inbox.flush()
+            # save transfer
+            for m in t.bulk_in:
+                if args.role == "host" and sender:
+                    sender.on_msg(m)
+                elif args.role == "client":
+                    receiver.on_msg(m)
+            t.bulk_in.clear()
+            if args.role == "host":
+                if sender:
+                    if sender.done:
+                        sender = None
+                        try:
+                            os.replace(save_out_ready, save_out_ready[:-6] + ".sent")
+                        except OSError:
+                            pass
+                    else:
+                        sender.tick()
+                elif time.monotonic() - last_save_check > 0.5 and t.connected():
+                    last_save_check = time.monotonic()
+                    if os.path.exists(save_out_ready):
+                        try:
+                            with open(save_out_ready, encoding="utf-8") as f:
+                                lines = [x.strip() for x in f.read().splitlines() if x.strip()]
+                            slot, names = lines[0], lines[1:]
+                            files = []
+                            for nm in names:
+                                with open(os.path.join(args.run_dir, "save_out", nm), "rb") as f:
+                                    files.append((nm, f.read()))
+                            next_tid += 1
+                            sender = SaveSender(t, log, next_tid, slot, files)
+                        except (OSError, IndexError) as e:
+                            log(f"save transfer: cannot read the save files yet ({e})")
             chunk = outbox.read()
             if chunk:
                 buf += chunk
